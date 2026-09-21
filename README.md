@@ -1,0 +1,171 @@
+# RF Intermodulation Analysis API（射频互调分析 API）
+
+基于 **FastAPI + SQLite** 的射频三阶互调（`2·fa − fb`）分析服务。
+
+创建站点（频率方案）并录入整数 Hz 表示的载频、扫描范围、保护频段与保护间隔；
+服务端枚举不同载频组合的三阶互调产物，过滤扫描范围外的结果，对同频产物聚合全部来源组合，
+并计算每个产物到载频或保护频段的最短距离。分析结果按频率稳定排序并持久化，可随时查询。
+
+## 快速开始（单条命令）
+
+```bash
+docker compose up --build
+```
+
+启动后：
+
+- **API 地址**：`http://localhost:8000`
+- **交互式文档（Swagger UI）**：`http://localhost:8000/docs`
+- **OpenAPI JSON**：`http://localhost:8000/openapi.json`
+- **端口**：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 中修改）
+
+数据库文件在容器启动时自动初始化（幂等建表），无需手动迁移；
+数据持久化在命名卷 `imd-data`（容器内路径 `/data/intermod.db`）中。
+
+停止并清理：`docker compose down`（加 `-v` 同时删除数据卷）。
+
+## 分析语义
+
+- **产物枚举**：对全部有序载频对 `(fa, fb)` 且 `fa ≠ fb` 计算 `2·fa − fb`。
+- **范围过滤**：仅保留落在 `[scan_start_hz, scan_end_hz]`（闭区间）内的产物。
+- **同频聚合**：同一产物频率的全部来源组合 `(fa, fb)` 聚合到一条结果中，按 `(fa, fb)` 升序排列。
+- **最短距离与命中对象**：
+  - 到载频的距离：`|f − fc|`；
+  - 到保护频段的距离：落在带内为 `0`，否则为到最近边界的距离；
+  - 取二者中的最小值作为 `distance_hz`，对应对象即 `hit`（`carrier` 或 `guard_band`）；
+  - 距离相同时按确定性规则决胜：载频优先于保护频段，其次按参考频率升序。
+- **保护间隔**：`violates_guard_interval = (distance_hz < guard_interval_hz)`，
+  即产物到命中对象的间距小于保护间隔时判定为违规。
+- **排序**：结果按产物频率升序；同频产物已聚合，频率唯一，排序稳定确定。
+
+## 风险分组（risk groups）
+
+`GET /analyses/{analysis_id}/risk-groups` 仅基于**已持久化**的分析结果计算，不重新扫描：
+
+- **风险节点**：每个 `violates_guard_interval = true` 的违规产物是一个节点；
+  非违规产物不参与（不会把不同簇桥接起来）。
+- **连边**：节点的全部来源组合 `(fa_hz, fb_hz)` 中的载频都与该节点相连，
+  构成"产物 ↔ 载频"二部图；同频产物的多来源已聚合在同一节点。
+- **归组**：二部图的每个连通分量即一个风险组——共享载频的产物沿链式边传递归组。
+- **每组字段**：`carriers_hz`（升序）、`product_freqs_hz`（升序）、
+  `source_pair_count`（组内来源组合总数）、`distance_hz`（组内最小距离）。
+- **稳定编号**：组按 `(最小载频, 最小产物频率)` 升序排序后，`group_id` 从 1 连续编号；
+  各组载频集合互不相交，排序键唯一，编号稳定可复现。
+- 分析不存在 → `404`；无违规产物 → `200` 返回空列表 `[]`。
+
+## 校验规则（整批拒绝）
+
+- 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
+- 扫描范围：`scan_end_hz > scan_start_hz`，均为正整数。
+- 保护频段：`end_hz > start_hz`，均为正整数。
+- 保护间隔：非负整数。
+- 任一校验失败 → `422`，**整批拒绝**，不写入任何数据（多表写入在单个事务中完成，失败即回滚）。
+- 站点名称全局唯一，重名 → `409`。
+
+## API 一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/health` | 健康检查 |
+| `POST` | `/sites` | 创建站点（频率方案），`201` |
+| `GET` | `/sites` | 列出全部已保存方案 |
+| `GET` | `/sites/{site_id}` | 查询单个已保存方案 |
+| `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201` |
+| `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
+| `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
+| `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
+| `GET` | `/analyses/{analysis_id}/risk-groups` | 按已保存分析结果生成风险分组（违规产物 ↔ 来源载频的二部图连通分量） |
+
+### 示例
+
+```bash
+# 创建方案
+curl -X POST http://localhost:8000/sites \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "name": "site-a",
+        "scan_start_hz": 1,
+        "scan_end_hz": 10000,
+        "guard_interval_hz": 150,
+        "carriers_hz": [100, 300, 400],
+        "guard_bands": [{"start_hz": 480, "end_hz": 520}]
+      }'
+
+# 执行分析（载频 100/300/400 时，2*300-100 与 2*400-300 同为 500 Hz，会聚合为一条）
+curl -X POST http://localhost:8000/sites/1/analysis
+
+# 查询已保存的方案与分析结果
+curl http://localhost:8000/sites/1
+curl http://localhost:8000/sites/1/analysis
+
+# 查询风险分组（违规产物与来源载频的连通分量）
+curl http://localhost:8000/analyses/1/risk-groups
+```
+
+分析响应节选：
+
+```json
+{
+  "analysis_id": 1,
+  "site_id": 1,
+  "product_count": 3,
+  "products": [
+    {
+      "freq_hz": 500,
+      "distance_hz": 0,
+      "hit": {"type": "guard_band", "carrier_hz": null,
+              "guard_band": {"start_hz": 480, "end_hz": 520}},
+      "violates_guard_interval": true,
+      "sources": [{"fa_hz": 300, "fb_hz": 100}, {"fa_hz": 400, "fb_hz": 300}]
+    }
+  ]
+}
+```
+
+风险分组响应示例（上例中违规产物 200 与 500 共享载频 300/400，归为一组）：
+
+```json
+[
+  {
+    "group_id": 1,
+    "carriers_hz": [100, 300, 400],
+    "product_freqs_hz": [200, 500],
+    "source_pair_count": 3,
+    "distance_hz": 0
+  }
+]
+```
+
+## 本地开发（不用 Docker）
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+
+# 运行测试（19 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组）
+pytest
+
+# 启动服务，API 位于 http://127.0.0.1:8000
+uvicorn app.main:app --reload
+```
+
+## 配置
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `IMD_DB_PATH` | `./intermod.db`（容器内 `/data/intermod.db`） | SQLite 数据库文件路径 |
+
+## 项目结构
+
+```
+app/
+  main.py       # FastAPI 应用与路由，启动时初始化数据库
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）
+  database.py   # SQLite 建表与读写（单事务批量写入）
+  schemas.py    # Pydantic 请求/响应模型与校验
+tests/
+  test_api.py   # 端到端测试（TestClient + 临时数据库）
+Dockerfile
+docker-compose.yml
+requirements.txt / requirements-dev.txt
+```
