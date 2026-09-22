@@ -1,7 +1,7 @@
 """三阶互调产物分析：枚举 2*fa - fb，聚合来源并评估最近命中对象。"""
 from __future__ import annotations
 
-from .schemas import GuardBand, HitObject, ProductOut, RiskGroup, SourcePair
+from .schemas import GuardBand, HitObject, MitigationPlan, ProductOut, RiskGroup, SourcePair
 
 
 def enumerate_third_order_products(
@@ -150,3 +150,67 @@ def build_risk_groups(products: list[ProductOut]) -> list[RiskGroup]:
     for group_id, group in enumerate(groups, start=1):
         group.group_id = group_id
     return groups
+
+
+def build_mitigation_plan(
+    products: list[ProductOut], analysis_id: int, max_disabled: int
+) -> MitigationPlan:
+    """基于已持久化分析结果，求消除全部违规产物的精确最小停用载频集合。
+
+    消除语义：对一个违规产物，其每个来源组合 (fa, fb) 都必须至少有一个载频被
+    停用才算消除；即停用集合必须"击中"该产物的全部来源边。对全部违规产物而言，
+    等价于在"全部违规产物来源边（去重、无向）的并图"上求最小顶点覆盖。
+
+    由于 max_disabled <= 8，采用边分支有界搜索：任取一条未被覆盖的边，必须停用
+    其两个端点之一，递归深度即停用数，叶子最多 2**max_disabled 个。搜索中先以
+    较小端点分支，并始终保留 (集合尺寸, 升序列表) 字典序最弱的最优解，保证
+    多个最小解时的决胜规则稳定确定。
+
+    限制内不存在覆盖时 feasible=false，停用集合为空，remaining 列出全部违规
+    产物频率（即不采取任何停用时仍未消除的产物）。
+    """
+    violating = [p for p in products if p.violates_guard_interval]
+    remaining = sorted(p.freq_hz for p in violating)
+
+    # 来源边：同频产物的多来源及不同产物的重复来源只保留一条（无向去重）
+    edges: set[frozenset[int]] = set()
+    for product in violating:
+        for source in product.sources:
+            edges.add(frozenset((source.fa_hz, source.fb_hz)))
+
+    best: tuple[int, ...] | None = None  # 当前最优解（升序元组），None 表示尚未找到
+
+    def search(remaining_edges: set[frozenset[int]], used: tuple[int, ...]) -> None:
+        nonlocal best
+        # 不劣于已有最优解即剪枝：只接受严格更小、或同尺寸字典序更弱的解
+        if best is not None and (len(used), used) >= (len(best), best):
+            return
+        if len(used) > max_disabled:
+            return
+        if not remaining_edges:
+            best = used
+            return
+        # 已用满预算但仍有未覆盖边；分支只会增加停用数
+        if len(used) == max_disabled:
+            return
+
+        edge = min(remaining_edges, key=lambda e: (min(e), max(e)))
+        u, v = sorted(edge)  # 先尝试较小端点，使字典序弱的解更早出现
+        for endpoint in (u, v):
+            # 未覆盖边的两个端点都不在 used 中，故每个分支恰好新增一个停用载频
+            search(
+                {e for e in remaining_edges if endpoint not in e},
+                tuple(sorted(used + (endpoint,))),
+            )
+
+    # 边集为空（无违规产物）时空集即尺寸 0 的覆盖：search 立即以 () 命中
+    search(edges, ())
+
+    feasible = best is not None
+    return MitigationPlan(
+        analysis_id=analysis_id,
+        max_disabled=max_disabled,
+        feasible=feasible,
+        disabled_carriers_hz=list(best) if feasible else [],
+        remaining_product_freqs_hz=[] if feasible else remaining,
+    )

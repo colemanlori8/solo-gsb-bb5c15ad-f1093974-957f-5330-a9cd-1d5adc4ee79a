@@ -257,5 +257,145 @@ def test_risk_groups_use_persisted_result(client):
     assert [g["group_id"] for g in first] == list(range(1, len(first) + 1))
 
 
+# ---------------------------------------------------------------- 缓解方案（最小停用集合）
+
+def _create_analysis(client, **overrides):
+    client.post("/sites", json=make_payload(**overrides))
+    return client.post("/sites/1/analysis").json()["analysis_id"]
+
+
+def test_mitigation_plan_404(client):
+    assert client.get("/analyses/999/mitigation-plan", params={"max_disabled": 3}).status_code == 404
+
+
+def test_mitigation_plan_validates_max_disabled(client):
+    analysis_id = _create_analysis(client)
+    # 缺少必填参数、超出 1～8 范围一律 422
+    assert client.get(f"/analyses/{analysis_id}/mitigation-plan").status_code == 422
+    assert client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 0}
+    ).status_code == 422
+    assert client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 9}
+    ).status_code == 422
+    # 边界值 1 与 8 合法
+    assert client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 1}
+    ).status_code == 200
+    assert client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 8}
+    ).status_code == 200
+
+
+def test_mitigation_plan_no_violations_feasible_empty(client):
+    # guard_interval_hz=0：无违规产物，无需停用任何载频
+    analysis_id = _create_analysis(client, guard_interval_hz=0)
+    resp = client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 1}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "analysis_id": analysis_id,
+        "max_disabled": 1,
+        "feasible": True,
+        "disabled_carriers_hz": [],
+        "remaining_product_freqs_hz": [],
+    }
+
+
+def test_mitigation_plan_picks_exact_minimum_and_lex_tiebreak(client):
+    # 载频 [100, 300, 400]：违规产物 200（边 {300,400}）与 500（边 {300,100}、{400,300}）
+    # 来源边并图为 100-300-400 路径，停用单个载频 300 即可覆盖全部边，最小尺寸为 1
+    analysis_id = _create_analysis(client)
+    resp = client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 3}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "analysis_id": analysis_id,
+        "max_disabled": 3,
+        "feasible": True,
+        "disabled_carriers_hz": [300],
+        "remaining_product_freqs_hz": [],
+    }
+
+
+def test_mitigation_plan_size_one_tiebreak_prefers_smaller_carrier(client):
+    # 单条违规来源边 {100, 200}：停 100 或 200 均为最小解，按升序列表字典序取 100
+    analysis_id = _create_analysis(
+        client, carriers_hz=[100, 200], guard_bands=[], guard_interval_hz=300
+    )
+    body = client.post("/sites/1/analysis").json()
+    assert {p["freq_hz"] for p in body["products"] if p["violates_guard_interval"]} == {300}
+
+    resp = client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 1}
+    )
+    assert resp.json()["feasible"] is True
+    assert resp.json()["disabled_carriers_hz"] == [100]
+
+
+def test_mitigation_plan_two_disjoint_edges_requires_two(client):
+    # 两簇载频 {100,200} 与 {5000,6000} 各成一条违规边 {100,200} 与 {5000,6000}：
+    # 最小顶点覆盖为 2；同尺寸多个解（[100,5000]/[100,6000]/[200,5000]/[200,6000]），
+    # 按升序列表字典序取 [100, 5000]
+    analysis_id = _create_analysis(
+        client,
+        carriers_hz=[100, 200, 5000, 6000],
+        scan_start_hz=1,
+        scan_end_hz=100000,
+        guard_interval_hz=1100,
+    )
+
+    # max_disabled=1：两簇互不相交，无法同时消除
+    infeasible = client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 1}
+    ).json()
+    assert infeasible["feasible"] is False
+    assert infeasible["disabled_carriers_hz"] == []
+    assert infeasible["remaining_product_freqs_hz"] == [300, 4000, 7000]
+
+    # max_disabled=2：精确最小解，字典序决胜
+    feasible = client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 2}
+    ).json()
+    assert feasible["feasible"] is True
+    assert feasible["disabled_carriers_hz"] == [100, 5000]
+    assert feasible["remaining_product_freqs_hz"] == []
+
+    # 放宽上限不改变最小解
+    relaxed = client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 8}
+    ).json()
+    assert relaxed["feasible"] is True
+    assert relaxed["disabled_carriers_hz"] == [100, 5000]
+
+
+def test_mitigation_plan_multi_source_product_must_hit_every_source(client):
+    # 载频 [100, 300, 400]：违规产物 500 同时由 (300,100) 与 (400,300) 产生，
+    # 必须击中两条来源边；仅停用 100 时 (400,300) 仍在，产物不消除 -> 取 300
+    analysis_id = _create_analysis(client, carriers_hz=[100, 300, 400])
+    # 先确认仅停 100 不足以消除 500（400/300 仍工作）：通过 max_disabled=1 的最优解为 300
+    body = client.get(
+        f"/analyses/{analysis_id}/mitigation-plan", params={"max_disabled": 1}
+    ).json()
+    assert body["feasible"] is True
+    assert body["disabled_carriers_hz"] == [300]
+
+
+def test_mitigation_plan_uses_persisted_result_only(client):
+    # 缓解方案仅基于已持久化的分析结果：相同参数重复查询完全一致
+    analysis_id = _create_analysis(
+        client,
+        carriers_hz=[100, 200, 5000, 6000],
+        scan_end_hz=100000,
+        guard_interval_hz=1100,
+    )
+    params = {"max_disabled": 2}
+    first = client.get(f"/analyses/{analysis_id}/mitigation-plan", params=params).json()
+    second = client.get(f"/analyses/{analysis_id}/mitigation-plan", params=params).json()
+    assert first == second
+
+
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}

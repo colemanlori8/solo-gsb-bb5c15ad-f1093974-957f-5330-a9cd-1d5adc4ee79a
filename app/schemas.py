@@ -108,3 +108,25 @@ class RiskGroup(BaseModel):
     product_freqs_hz: list[int] = Field(..., description="组内违规产物频率，升序")
     source_pair_count: int = Field(..., description="组内全部产物的来源组合总数")
     distance_hz: int = Field(..., description="组内产物到命中对象的最小距离")
+
+
+class MitigationPlan(BaseModel):
+    """缓解方案：消除全部违规产物所需停用的最小载频集合（来源边图的最小顶点覆盖）。"""
+
+    analysis_id: int
+    max_disabled: int = Field(..., description="允许停用的载频数上限（1～8）")
+    feasible: bool = Field(
+        ..., description="停用数不超过 max_disabled 时能否消除全部违规产物"
+    )
+    disabled_carriers_hz: list[int] = Field(
+        ...,
+        description=(
+            "精确最小停用载频集合（升序）；多个同尺寸最小解时取升序列表字典序最弱者。"
+            "feasible=false 时为空列表"
+        ),
+    )
+    remaining_product_freqs_hz: list[int] = Field(
+        ...,
+        description="仍未消除的违规产物频率（升序）；feasible=true 时为空列表，"
+        "feasible=false 时为全部违规产物频率",
+    )

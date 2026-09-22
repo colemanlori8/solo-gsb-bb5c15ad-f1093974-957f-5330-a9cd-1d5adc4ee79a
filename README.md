@@ -53,6 +53,26 @@ docker compose up --build
   各组载频集合互不相交，排序键唯一，编号稳定可复现。
 - 分析不存在 → `404`；无违规产物 → `200` 返回空列表 `[]`。
 
+## 缓解方案（mitigation plan）
+
+`GET /analyses/{analysis_id}/mitigation-plan?max_disabled=k`（`k` 取 **1～8** 的整数）
+同样**仅使用已持久化**的分析结果，为全部违规产物求精确的**最小停用载频集合**：
+
+- **消除语义**：一个违规产物只有在其**每个来源组合** `(fa_hz, fb_hz)` 中至少停用一个载频时
+  才算被消除（仅堵住部分来源时该产物仍由其余组合产生）。
+- **图模型**：把全部违规产物的全部来源组合视为无向边（同频多来源、跨产物重复来源去重），
+  停用集合必须覆盖每一条边——即求来源边并图的**最小顶点覆盖**。
+- **精确最优**：`max_disabled ≤ 8`，使用边分支有界搜索求精确最小尺寸（叶子数至多 `2^k`），
+  不使用近似算法。
+- **多解决胜**：存在多个相同尺寸的最小解时，按载频**升序列表的字典序**取最弱者
+  （如 `[100,5000] < [100,6000] < [200,5000]`）。
+- **响应字段**：
+  - `feasible`：限制内能否消除全部违规产物；
+  - `disabled_carriers_hz`：最小停用载频集合（升序）；无违规产物时为空列表 `[]`（尺寸 0 的空解）；
+  - `remaining_product_freqs_hz`：仍未消除的违规产物频率（升序）；可行时为空列表，
+    不可行时为**全部**违规产物频率（即不停用任何载频时仍未消除的集合）。
+- 分析不存在 → `404`；`max_disabled` 缺失或不在 1～8 → `422`。
+
 ## 校验规则（整批拒绝）
 
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
@@ -75,6 +95,7 @@ docker compose up --build
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
 | `GET` | `/analyses/{analysis_id}/risk-groups` | 按已保存分析结果生成风险分组（违规产物 ↔ 来源载频的二部图连通分量） |
+| `GET` | `/analyses/{analysis_id}/mitigation-plan?max_disabled=k` | 求消除全部违规产物的精确最小停用载频集合（最小顶点覆盖，`k` 取 1～8） |
 
 ### 示例
 
@@ -100,6 +121,9 @@ curl http://localhost:8000/sites/1/analysis
 
 # 查询风险分组（违规产物与来源载频的连通分量）
 curl http://localhost:8000/analyses/1/risk-groups
+
+# 求缓解方案：最多停用 2 个载频，消除全部违规产物的精确最小集合
+curl 'http://localhost:8000/analyses/1/mitigation-plan?max_disabled=2'
 ```
 
 分析响应节选：
@@ -136,13 +160,37 @@ curl http://localhost:8000/analyses/1/risk-groups
 ]
 ```
 
+缓解方案响应示例（上例中违规来源边为 `{300,400}` 与 `{300,100}`，单独停用载频 300 即可全部消除）：
+
+```json
+{
+  "analysis_id": 1,
+  "max_disabled": 2,
+  "feasible": true,
+  "disabled_carriers_hz": [300],
+  "remaining_product_freqs_hz": []
+}
+```
+
+限制内无解时（如两簇互不相交的违规来源边，`max_disabled=1`）：
+
+```json
+{
+  "analysis_id": 1,
+  "max_disabled": 1,
+  "feasible": false,
+  "disabled_carriers_hz": [],
+  "remaining_product_freqs_hz": [300, 4000, 7000]
+}
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（19 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组）
+# 运行测试（27 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、缓解方案）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -160,7 +208,7 @@ uvicorn app.main:app --reload
 ```
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、缓解方案（最小顶点覆盖）
   database.py   # SQLite 建表与读写（单事务批量写入）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
