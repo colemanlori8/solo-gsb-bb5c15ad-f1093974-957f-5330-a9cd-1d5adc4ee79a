@@ -4,11 +4,18 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 
 from . import database
-from .analysis import analyze, build_risk_groups
-from .schemas import AnalysisMeta, AnalysisResult, RiskGroup, SiteCreate, SiteOut
+from .analysis import analyze, build_mitigation_plan, build_risk_groups
+from .schemas import (
+    AnalysisMeta,
+    AnalysisResult,
+    MitigationPlan,
+    RiskGroup,
+    SiteCreate,
+    SiteOut,
+)
 
 
 @asynccontextmanager
@@ -150,3 +157,28 @@ def get_risk_groups(analysis_id: int) -> list[RiskGroup]:
     if result is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
     return build_risk_groups(result.products)
+
+
+@app.get(
+    "/analyses/{analysis_id}/mitigation-plan",
+    response_model=MitigationPlan,
+    tags=["analysis"],
+    summary="为已保存分析的全部违规产物求最小停用载频集合（精确最小点覆盖）",
+    description=(
+        "仅使用已持久化的分析结果，不重新扫描。每个违规产物的每个来源组合 "
+        "(fa_hz, fb_hz) 中至少停用一个载频，该产物才算被消除；在停用数不超过 "
+        "max_disabled（1～8）的前提下精确求基数最小的停用集合，存在多个最小解时"
+        "按载频升序列表的字典序择优。上限内无解时 feasible=false，并给出上限内"
+        "消除产物最多的尽力方案与仍未消除的产物频率。分析不存在返回 404。"
+    ),
+)
+def get_mitigation_plan(
+    analysis_id: int,
+    max_disabled: int = Query(
+        ..., ge=1, le=8, description="允许停用的最大载频数，取 1～8 的整数"
+    ),
+) -> MitigationPlan:
+    result = database.fetch_analysis(analysis_id)
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
+    return build_mitigation_plan(result.products, analysis_id, max_disabled)

@@ -108,3 +108,28 @@ class RiskGroup(BaseModel):
     product_freqs_hz: list[int] = Field(..., description="组内违规产物频率，升序")
     source_pair_count: int = Field(..., description="组内全部产物的来源组合总数")
     distance_hz: int = Field(..., description="组内产物到命中对象的最小距离")
+
+
+class MitigationPlan(BaseModel):
+    """违规产物停用方案：在停用载频数上限内精确求解最小停用集合（最小点覆盖）。
+
+    判定规则：某违规产物的每个来源组合 (fa_hz, fb_hz) 中至少一个载频被停用，
+    该产物才算被消除。feasible=true 时给出基数最小的停用集合，多个最小解按
+    载频升序列表的字典序择优；feasible=false 时给出上限内消除违规产物最多的
+    尽力方案及仍未消除的产物频率。
+    """
+
+    analysis_id: int
+    max_disabled: int = Field(..., description="本次求解允许停用的最大载频数（1～8）")
+    feasible: bool = Field(..., description="上限内是否存在可消除全部违规产物的停用集合")
+    disabled_carriers_hz: list[int] = Field(
+        ...,
+        description="建议停用的载频（升序）。feasible=true 时为基数最小、字典序择优的精确解；"
+        "feasible=false 时为上限内消除违规产物最多（并列时覆盖来源组合最多、再按字典序）的方案",
+    )
+    eliminated_product_freqs_hz: list[int] = Field(
+        ..., description="该方案下可消除的违规产物频率（升序）；feasible=true 时为全部违规产物"
+    )
+    remaining_product_freqs_hz: list[int] = Field(
+        ..., description="该方案下仍未消除的违规产物频率（升序）；feasible=true 时恒为空列表"
+    )
